@@ -1,0 +1,19 @@
+# Byte‐compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual env
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# PyTest cache
+.pytest_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
