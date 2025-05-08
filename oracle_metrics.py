@@ -175,7 +175,8 @@ if __name__ == "__main__":
             args.password = open(args.pfile).read().strip()
         except Exception as e:
             handle_error(e)
-
+    
+    m = None
     try:
         m = OracleMetrics(args)
         m.getWaitClassStats()
@@ -186,5 +187,5 @@ if __name__ == "__main__":
     except Exception as e:
         handle_error(e)
     finally:
-        if hasattr(m, "connection"):
+        if m is not None and hasattr(m, "connection"):
             m.connection.close()
