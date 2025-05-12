@@ -1,0 +1,5 @@
+oracle:
+  user:     system
+  password: MySecretPass123
+  dsn:      host.docker.internal:1521/XE
+  instance: MYDB

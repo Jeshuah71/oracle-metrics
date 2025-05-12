@@ -1,36 +1,44 @@
-#!/usr/bin/env python3
-"""
-oracle_metrics.py
+import os
 
-Script to extract Oracle metrics in InfluxDB Line Protocol format
-using the python-oracledb driver (thin mode).
-"""
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mysettings")
 
-import argparse
+# 2) initialize Django
+import django
+django.setup()
+
+# 3) now we can import dbconfig and pull our creds
+import dbconfig
+cred = dbconfig.get("oracle")
+USER     = cred["user"]
+PASSWORD = cred["password"]
+DSN      = cred["dsn"]
+INSTANCE = cred.get("instance", "")
+
 import re
 import sys
-import oracledb  # real driver
+import oracledb
 
 
-def handle_error(error_message):
-    """Telegraf expects 'ERROR|<msg>' on stderr and non-zero exit."""
-    sys.stderr.write(f"ERROR|{error_message}\n")
+def handle_error(err):
+    """Print Telegraf-style ERROR|<msg> and exit nonzero."""
+    sys.stderr.write(f"ERROR|{err}\n")
     sys.exit(1)
 
 
 class OracleMetrics:
-    def __init__(self, args):
-        self.instance = args.instance
+    def __init__(self):
+        self.instance = INSTANCE
         try:
             self.connection = oracledb.connect(
-                user=args.user,
-                password=args.password,
-                dsn=args.dsn
+                user=USER,
+                password=PASSWORD,
+                dsn=DSN
             )
         except oracledb.DatabaseError as e:
             handle_error(e)
 
     def getWaitClassStats(self):
+        cur = None
         try:
             cur = self.connection.cursor()
             cur.execute("""
@@ -47,9 +55,10 @@ class OracleMetrics:
         except Exception as e:
             handle_error(e)
         finally:
-            cur.close()
+            if cur: cur.close()
 
     def getWaitStats(self):
+        cur = None
         try:
             cur = self.connection.cursor()
             cur.execute("""
@@ -66,14 +75,14 @@ class OracleMetrics:
             """)
             for _wc, wait_name, cnt, avg_ms in cur:
                 we = re.sub(r"\s+", "_", wait_name)
-                # **only** wait_event tag (tests look for this)
                 print(f"oracle_wait_event,instance={self.instance},wait_event={we} count={cnt},latency={avg_ms}")
         except Exception as e:
             handle_error(e)
         finally:
-            cur.close()
+            if cur: cur.close()
 
     def getSysmetrics(self):
+        cur = None
         try:
             cur = self.connection.cursor()
             cur.execute("""
@@ -87,9 +96,10 @@ class OracleMetrics:
         except Exception as e:
             handle_error(e)
         finally:
-            cur.close()
+            if cur: cur.close()
 
     def getTableSpaceStats(self):
+        cur = None
         try:
             cur = self.connection.cursor()
             cur.execute("""
@@ -101,9 +111,9 @@ class OracleMetrics:
                   FROM (
                     SELECT m.tablespace_name,
                            m.used_space * t.block_size/1024/1024 used_space,
-                           (CASE WHEN t.bigfile = 'YES'
-                                 THEN POWER(2,32)*t.block_size/1024/1024
-                                 ELSE tablespace_size*t.block_size/1024/1024
+                           (CASE WHEN t.bigfile='YES'
+                             THEN POWER(2,32)*t.block_size/1024/1024
+                             ELSE tablespace_size*t.block_size/1024/1024
                             END) max_size
                       FROM dba_tablespace_usage_metrics m
                       JOIN dba_tablespaces t
@@ -121,7 +131,7 @@ class OracleMetrics:
         except Exception as e:
             handle_error(e)
         finally:
-            cur.close()
+            if cur: cur.close()
 
     def getMiscMetrics(self):
         try:
@@ -129,63 +139,29 @@ class OracleMetrics:
             cur = self.connection.cursor()
             cur.execute("SELECT status, COUNT(*) FROM V$SESSION GROUP BY status")
             for status, cnt in cur:
-                print(
-                    f"oracle_connectioncount,instance={self.instance},"
-                    f"metric_name={status} metric_value={cnt}"
-                )
+                print(f"oracle_connectioncount,instance={self.instance},metric_name={status} metric_value={cnt}")
             cur.close()
 
-            # now pull the two aliases out of the same v$instance mapping
+            # instance & db status
             cur = self.connection.cursor()
-            cur.execute("""
-                SELECT status, COUNT(*) FROM v$instance GROUP BY status
-            """)
+            cur.execute("SELECT status, COUNT(*) FROM v$instance GROUP BY status")
             rows = list(cur)
             cur.close()
 
-            # pick off OPEN ⇒ instance_status, ACTIVE ⇒ database_status
-            open_val   = next((c for s, c in rows if s.upper() == "OPEN"),   0)
-            active_val = next((c for s, c in rows if s.upper() == "ACTIVE"), 0)
+            open_val   = next((c for s,c in rows if s.upper()=="OPEN"),   0)
+            active_val = next((c for s,c in rows if s.upper()=="ACTIVE"), 0)
 
-            print(
-                f"oracle_status,instance={self.instance},"
-                f"metric_name=instance_status metric_value={open_val}"
-            )
-            print(
-                f"oracle_status,instance={self.instance},"
-                f"metric_name=database_status metric_value={active_val}"
-            )
+            print(f"oracle_status,instance={self.instance},metric_name=instance_status metric_value={open_val}")
+            print(f"oracle_status,instance={self.instance},metric_name=database_status metric_value={active_val}")
+
         except Exception as e:
             handle_error(e)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Extract Oracle metrics in InfluxDB format using python-oracledb"
-    )
-    parser.add_argument("-u", "--user",     required=True)
-    parser.add_argument("-p", "--password", default="")
-    parser.add_argument("-d", "--dsn",      required=True)
-    parser.add_argument("-i", "--instance", required=True)
-    parser.add_argument("--pfile")
-    args = parser.parse_args()
-
-    if args.pfile:
-        try:
-            args.password = open(args.pfile).read().strip()
-        except Exception as e:
-            handle_error(e)
-    
-    m = None
-    try:
-        m = OracleMetrics(args)
-        m.getWaitClassStats()
-        m.getWaitStats()
-        m.getSysmetrics()
-        m.getTableSpaceStats()
-        m.getMiscMetrics()
-    except Exception as e:
-        handle_error(e)
-    finally:
-        if m is not None and hasattr(m, "connection"):
-            m.connection.close()
+    m = OracleMetrics()
+    m.getWaitClassStats()
+    m.getWaitStats()
+    m.getSysmetrics()
+    m.getTableSpaceStats()
+    m.getMiscMetrics()
