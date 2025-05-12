@@ -1,8 +1,8 @@
 import os
 import sys
 import re
-
 import yaml
+import oracledb
 
 CONFIG_PATH = os.getenv("ORACLE_CONFIG", "/etc/telegraf/oracle.yml")
 
@@ -13,26 +13,24 @@ def handle_error(err):
 try:
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
-    oracle = cfg["oracle"]
-    USER     = oracle["user"]
-    PASSWORD = oracle["password"]
-    DSN      = oracle["dsn"]
-    INSTANCE = oracle.get("instance", DSN.split("/")[-1])
+    oracle_cfg = cfg["oracle"]
+    USER     = oracle_cfg["user"]
+    PASSWORD = oracle_cfg["password"]
+    DSN      = oracle_cfg["dsn"]
+    INSTANCE = oracle_cfg.get("instance", DSN.split("/")[-1])
+    DYNAMIC_METRICS = cfg.get("metrics", [])
 except Exception as e:
-    handle_error(f"Could not load YAML config: {e}")
+    handle_error(f"could not load YAML config: {e}")
 
-import oracledb
+try:
+    conn = oracledb.connect(user=USER, password=PASSWORD, dsn=DSN)
+except oracledb.DatabaseError as e:
+    handle_error(e)
 
 class OracleMetrics:
-
-    def __init__(self):
-        try:
-            self.conn = oracledb.connect(
-                user=USER, password=PASSWORD, dsn=DSN
-            )
-        except oracledb.DatabaseError as e:
-            handle_error(e)
-        self.instance = INSTANCE
+    def __init__(self, conn, instance):
+        self.conn     = conn
+        self.instance = instance
 
     def getWaitClassStats(self):
         cur = self.conn.cursor()
@@ -48,8 +46,6 @@ class OracleMetrics:
             for wait_name, wait_value in cur:
                 tag = re.sub(r"\s+", "_", wait_name)
                 print(f"oracle_wait_class,instance={self.instance},wait_class={tag} wait_value={wait_value}")
-        except Exception as e:
-            handle_error(e)
         finally:
             cur.close()
 
@@ -62,18 +58,15 @@ class OracleMetrics:
                        m.wait_count,
                        NVL(ROUND(10*m.time_waited/NULLIF(m.wait_count,0),3),0) avg_ms
                   FROM v$eventmetric m
-                  JOIN v$event_name   n
+                  JOIN v$event_name n
                     ON m.event_id = n.event_id
                  WHERE n.wait_class <> 'Idle'
-                   AND m.wait_count  > 0
+                   AND m.wait_count > 0
                  ORDER BY 1
             """)
-            # tests only look for wait_event tag
             for _wc, wait_name, cnt, avg_ms in cur:
                 we = re.sub(r"\s+", "_", wait_name)
                 print(f"oracle_wait_event,instance={self.instance},wait_event={we} count={cnt},latency={avg_ms}")
-        except Exception as e:
-            handle_error(e)
         finally:
             cur.close()
 
@@ -88,8 +81,6 @@ class OracleMetrics:
             for name, val in cur:
                 tag = re.sub(r"\s+", "_", name)
                 print(f"oracle_sysmetric,instance={self.instance},metric_name={tag} metric_value={val}")
-        except Exception as e:
-            handle_error(e)
         finally:
             cur.close()
 
@@ -122,40 +113,60 @@ class OracleMetrics:
                     f"free_space_mb={free},percent_used={pct},"
                     f"max_size_mb={maximum}"
                 )
-        except Exception as e:
-            handle_error(e)
         finally:
             cur.close()
 
     def getMiscMetrics(self):
+        cur = self.conn.cursor()
         try:
             # session counts
-            cur = self.conn.cursor()
             cur.execute("SELECT status, COUNT(*) FROM V$SESSION GROUP BY status")
             for status, cnt in cur:
                 print(f"oracle_connectioncount,instance={self.instance},metric_name={status} metric_value={cnt}")
             cur.close()
-
-            # instance + database status
+            # instance & database status
             cur = self.conn.cursor()
             cur.execute("SELECT status, COUNT(*) FROM v$instance GROUP BY status")
             rows = list(cur)
+            for s,c in rows:
+                if s.upper()=="OPEN":
+                    print(f"oracle_status,instance={self.instance},metric_name=instance_status metric_value={c}")
+                elif s.upper()=="ACTIVE":
+                    print(f"oracle_status,instance={self.instance},metric_name=database_status metric_value={c}")
+        finally:
             cur.close()
 
-            open_val   = next((c for s,c in rows if s.upper()=="OPEN"),   0)
-            active_val = next((c for s,c in rows if s.upper()=="ACTIVE"), 0)
-
-            print(f"oracle_status,instance={self.instance},metric_name=instance_status metric_value={open_val}")
-            print(f"oracle_status,instance={self.instance},metric_name=database_status metric_value={active_val}")
-
+def run_dynamic_metrics(conn, instance, metrics_cfg):
+    for block in metrics_cfg:
+        ctx   = block["context"]
+        sql   = block["request"]
+        tagf  = block.get("fieldtoappend")
+        cur   = conn.cursor()
+        try:
+            cur.execute(sql)
+            for row in cur:
+                # two‐column case: [value, tag]
+                if tagf and len(row)==2:
+                    val, tagv = row
+                    tags = f"{tagf}={re.sub(r'\\s+','_',str(tagv))}"
+                    fields = f"value={val}"
+                else:
+                    # default: last col value, rest unnamed tags c1,c2…
+                    *tags_cols, val = row
+                    tags = ",".join(f"c{i}={re.sub(r'\\s+','_',str(v))}"
+                                    for i,v in enumerate(tags_cols,1))
+                    fields = f"value={val}"
+                print(f"oracle_{ctx},instance={instance},{tags} {fields}")
         except Exception as e:
-            handle_error(e)
-
+            handle_error(f"{ctx}: {e}")
+        finally:
+            cur.close()
 
 if __name__ == "__main__":
-    m = OracleMetrics()
-    m.getWaitClassStats()
-    m.getWaitStats()
-    m.getSysmetrics()
-    m.getTableSpaceStats()
-    m.getMiscMetrics()
+    om = OracleMetrics(conn, INSTANCE)
+    om.getWaitClassStats()
+    om.getWaitStats()
+    om.getSysmetrics()
+    om.getTableSpaceStats()
+    om.getMiscMetrics()
+    run_dynamic_metrics(conn, INSTANCE, DYNAMIC_METRICS)

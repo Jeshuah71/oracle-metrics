@@ -3,3 +3,50 @@ oracle:
   password: MySecretPass123
   dsn:      host.docker.internal:1521/XE
   instance: MYDB
+
+
+metrics:
+  # 1) this is the metric of Cache hit ratio this is Gauge not a queue
+  - context: cache_hit_ratio
+    metricsdesc:
+      percentage: "Gauge metric with the cache hit ratio."
+    request: |
+      SELECT ROUND(
+        (
+          SUM(DECODE(name,'consistent gets',value,0))
+          + SUM(DECODE(name,'db block gets',value,0))
+          - SUM(DECODE(name,'physical reads',value,0))
+        )
+        /
+        (
+          SUM(DECODE(name,'consistent gets',value,0))
+          + SUM(DECODE(name,'db block gets',value,0))
+        ) * 100
+      ,2) AS value
+      FROM v$sysstat
+
+  # 2) AQ message counts per queue
+  - context: aq_messages
+    metricsdesc:
+      count: "Gauge of the number of messages waiting per Advanced Queue."
+    fieldtoappend: queue
+    request: |
+      SELECT 'qz_success_hub_events_table' AS queue, COUNT(*) AS value
+        FROM baninst1.qz_success_hub_events_table
+      UNION ALL
+      SELECT 'qz_idm_events_table', COUNT(*) FROM baninst1.qz_idm_events_table
+      UNION ALL
+      SELECT 'qz_transact_events_table', COUNT(*) FROM baninst1.qz_transact_events_table
+      UNION ALL
+      SELECT 'qz_canvas_events_table', COUNT(*) FROM baninst1.qz_canvas_events_table
+      UNION ALL
+      SELECT 'qz_payroll_events_table', COUNT(*) FROM baninst1.qz_payroll_events_table
+
+  # 3) AQ wait time per queue
+  - context: aq_wait_time
+    metricsdesc:
+      value: "Counter metric for message wait time in seconds per queue."
+    fieldtoappend: queue
+    request: |
+      SELECT wait_seconds AS value, queue
+        FROM gzv_queuelog_wait_time
